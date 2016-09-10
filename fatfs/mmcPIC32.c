@@ -15,6 +15,10 @@
 // Ported by Riccardo Leonardi to PIC32MX795F512L  (22/11/2011)
 // Many thanks to Aiden Morrison's good work!
 // changes: parametrization of SPI port number
+
+// Modified by Bryn Thomas (11/09/2016) to use Enhanced Buffer SPI mode
+// and boost read performance with 32-bit transfers
+
 #define _DISABLE_OPENADC10_CONFIGPORT_WARNING
 #define _SUPPRESS_PLIB_WARNING
 
@@ -99,10 +103,13 @@ UINT CardType;
 /* Exchange a byte between PIC and MMC via SPI  (Platform dependent)     */
 /*-----------------------------------------------------------------------*/
 
+// Regular receive and transmit functions changed to use
+// Enhanced Buffer semantics to reduce unnecessary mode changes
+
 #define xmit_spi(dat) 	xchg_spi(dat)
 #define rcvr_spi()		xchg_spi(0xFF)
 //#define rcvr_spi_m(p)	SPI2BUF = 0xFF; while (!SPI2STATbits.SPIRBF); *(p) = (BYTE)SPI2BUF;
-#define rcvr_spi_m(p)	SPIBUF = 0xFF; while (!SPISTATbits.SPIRBF); *(p) = (BYTE)SPIBUF;
+#define rcvr_spi_m(p)	SPIBUF = 0xFF; while (SPISTATbits.SPIRBE); *(p) = (BYTE)SPIBUF;
 
 static
 BYTE xchg_spi (BYTE dat)
@@ -111,10 +118,295 @@ BYTE xchg_spi (BYTE dat)
 //	while (!SPI2STATbits.SPIRBF);
 //	return (BYTE)SPI2BUF;
 	SPIBUF = dat;
-	while (!SPISTATbits.SPIRBF);
+	while (SPISTATbits.SPIRBE);
 	return (BYTE)SPIBUF;
 }
 
+static BYTE SPI_transaction_in_progress = 0;
+
+static int select(void);
+static void deselect(void);
+static void spi_init(void);
+static void spi_commit(void);
+static void spi_go_8(void);
+static void spi_go_32(void);
+
+// Buffers used to translate between the 32-bit chunks retrieved
+// and the 8-bit data required
+
+typedef union {
+    UINT raw_data[8];
+    BYTE transformed[32];
+} spi_union;
+
+static spi_union virtual_spi_rx;
+static BYTE virtual_spi_rx_count;
+static BYTE virtual_spi_rx_read_pos;
+static BYTE virtual_spi_rx_write_pos;
+
+static spi_union virtual_spi_tx;
+static INT virtual_spi_tx_count;
+static BYTE virtual_spi_tx_read_pos;
+static BYTE virtual_spi_tx_write_pos;
+
+// Used to maintain compatibility with existing unchanged functions
+// and handle the transitions between working with them and working
+// with the new 32-bit read functions
+
+static void end_active_SPI_transaction(void){
+    if (SPI_transaction_in_progress){
+        spi_go_8();
+        deselect();
+        SPI_transaction_in_progress = 0;
+    }
+}
+
+static void begin_SPI_transaction(void){
+    if (!SPI_transaction_in_progress){
+        select();
+        SPI_transaction_in_progress = 1;
+        spi_init();
+        spi_go_32();
+    }
+}
+
+// Transfers between the 32-bit system SPI buffers and the virtual
+// buffers that give easier access to 8-bit data
+
+static inline void read_spi_from_system(void){
+    BYTE count;
+    count = SPISTATbits.RXBUFELM;
+    while (count > 0) {
+        if (virtual_spi_rx_count > 27) return;
+        count--;
+        virtual_spi_rx_write_pos = (virtual_spi_rx_write_pos - 4) & 0x1F;
+        virtual_spi_rx.raw_data[virtual_spi_rx_write_pos >> 2] = SPIBUF;
+        virtual_spi_rx_count = virtual_spi_rx_count + 4;
+    }
+}
+
+static inline void send_spi_to_system(void){
+    BYTE count;
+    if (virtual_spi_rx_count > 15) return;
+    count = SPISTATbits.TXBUFELM;
+    while (virtual_spi_tx_count > 3) {
+        count++;
+        if (count > 2) return; 
+        virtual_spi_tx_read_pos = (virtual_spi_tx_read_pos - 4) & 0x1F;
+        SPIBUF = virtual_spi_tx.raw_data[virtual_spi_tx_read_pos >> 2];
+        virtual_spi_tx_count = virtual_spi_tx_count - 4;
+    }
+}
+
+// Switches between 8-bit and 32-bit modes. Clears hardware buffers first.
+
+static void spi_go_8(void) {
+    send_spi_to_system();
+    while ((SPISTATbits.SPIBUSY) || (!SPISTATbits.SPIRBE) || (!SPISTATbits.SPITBE)){read_spi_from_system();};
+    SPICONbits.MODE32 = 0;    
+}
+
+static void spi_go_32(void) {
+    while ((SPISTATbits.SPIBUSY) || (!SPISTATbits.SPITBE)) {};
+    SPICONbits.MODE32 = 1;
+}
+
+#define read_spi_byte() virtual_spi_rx.transformed[--virtual_spi_rx_read_pos & 0x1F]; virtual_spi_rx_count--;
+#define send_spi_byte(this_byte)  virtual_spi_tx_write_pos--;virtual_spi_tx.transformed[virtual_spi_tx_write_pos & 0x1F]=this_byte; virtual_spi_tx_count++;
+
+#define UNROLL_2(X) X X
+#define UNROLL_4(X) UNROLL_2(X) UNROLL_2(X)
+#define UNROLL_8(X) UNROLL_4(X) UNROLL_4(X)
+
+// Resets the virtual buffers to their default state
+
+static void spi_init(){
+    virtual_spi_rx_count = 0;
+    virtual_spi_rx_read_pos = 0;
+    virtual_spi_rx_write_pos = 0;    
+
+    virtual_spi_tx_count = 0;
+    virtual_spi_tx_read_pos = 0;
+    virtual_spi_tx_write_pos = 0; 
+}
+
+// Populates the virtual transmit buffers with 0xFF, which is
+// sent while waiting for a response from the slave device.
+
+static void spi_fill_send_cmd(void){
+    BYTE count;
+    for (count = 0;count < 32;count++){
+        virtual_spi_tx.transformed[count]=0xFF;
+    };
+}
+
+// Flushes all lingering data from the virtual buffers out the SPI bus
+// Switches to 8-bit to make sure it can clear out all stragglers
+
+static void spi_commit(void){
+    spi_go_8();
+    while ((SPISTATbits.SPIBUSY)){};
+    while (virtual_spi_tx_count > 0){
+        virtual_spi_tx_read_pos = (virtual_spi_tx_read_pos - 1) & 0x1F;
+        SPIBUF = virtual_spi_tx.transformed[virtual_spi_tx_read_pos];
+        virtual_spi_tx_count--;
+    }
+    while ((SPISTATbits.SPIBUSY) || (!SPISTATbits.SPITBE)) {};
+    while (!SPISTATbits.SPIRBE) {
+        virtual_spi_rx_write_pos = (virtual_spi_rx_write_pos - 1) & 0x1F;
+        virtual_spi_rx.transformed[virtual_spi_rx_write_pos] = SPIBUF;
+        virtual_spi_rx_count++;       
+    }
+    spi_go_32();
+}
+
+// A 32-bit compatible form of the rcvr_datablock function
+// This one however is only used for reading sectors, hence the
+// requirement of a multiple of 512
+
+static
+int rcvr_datablock32 (	/* 1:OK, 0:Failed */
+	BYTE *buff,			/* Data buffer to store received data */
+	INT btr			/* Byte count (must be multiple of 512) */
+)
+{
+  	BYTE token;
+    INT total_recv;
+    INT small_btr;
+    INT sectors_left;
+    INT donezo;
+    
+    spi_fill_send_cmd();
+    small_btr = 512;
+    sectors_left = btr >> 9;
+    // Data could have already been sent to the queue as part of the initial
+    // command that began the transfer.
+    // We make sure we take account of it when working out how many more SPI transactions
+    // are required.
+    // Since we know roughly how much data we will need to submit to the card, we preload
+    // the total transfer size and later in the program add or subtract from this value
+    // as needed
+    virtual_spi_tx_count = btr + sectors_left * 2 - (virtual_spi_rx_count + SPISTATbits.RXBUFELM*4);
+
+    total_recv = 0;
+
+    do {
+        sectors_left--;
+        do {							
+            read_spi_from_system();
+            send_spi_to_system();
+            if (virtual_spi_rx_count > 3){
+                // Wait for the card to signal to us that it's ready
+                UNROLL_4 (virtual_spi_tx_count++; token = read_spi_byte(); if (token != 0xFF) break;)
+            };
+    	} while (1);
+
+        // We expect the data to begin with a 0xFE signal
+        if(token != 0xFE) return 0;		/* If not valid data token, retutn with error */
+
+        if (sectors_left == 0) small_btr = small_btr - 16;
+
+        while ((total_recv < small_btr)) {
+            // This is the most performance sensitive part of this system
+            // Just one or two extra cycles needed to process instructions can
+            // mean one isn't able to use the full bus speed.
+            
+            // This means that instead of using the "send_spi_byte" helper
+            // we need to directly load up SPIBUF and adjust the virtual_spi_tx_count.
+            // It does mean that the relationship between tx_read_pos and tx_write_pos
+            // gets messed up, so before we write real values to the system we will
+            // need to perform an spi_init.
+            
+            read_spi_from_system();
+            if (virtual_spi_rx_count > 7) {
+                if ((virtual_spi_tx_count > 7) && !(virtual_spi_rx_count > 15)){
+                    SPIBUF=0xFFFFFFFF;
+                    SPIBUF=0xFFFFFFFF;
+                    virtual_spi_tx_count -= 8;
+                }
+                UNROLL_8(*(buff++) = read_spi_byte();)
+                total_recv = total_recv + 8;
+                continue;
+            }
+            send_spi_to_system();
+        };
+        if (sectors_left == 0) break;
+        
+        small_btr = small_btr+512;
+
+        while (virtual_spi_rx_count < 4) read_spi_from_system();
+        UNROLL_2(read_spi_byte();)
+    } while (sectors_left > 0);
+    
+    donezo = 0;
+    
+    // Since there is absolutely no guarantee that the number of bytes we
+    // actually read will be a multiple of 4, we need to switch out of 32-bit
+    // mode and make sure we pick up the last of the stragglers.
+
+	while ((total_recv < btr)) {							
+        if ((virtual_spi_rx_count > 0)) {*(buff++) = read_spi_byte();total_recv++;};
+        if (!donezo){
+            read_spi_from_system();
+            send_spi_to_system();
+            if ((virtual_spi_tx_count < 4)) {    
+                spi_commit();
+                donezo = 1;
+            };
+        };
+	};
+
+    spi_commit();
+    
+    // Read the last two CRC bytes and ignore them
+    read_spi_byte();
+    read_spi_byte();
+    spi_init();
+    
+	return 1;						/* Return with success */
+}
+
+// 32-bit version of the send_cmd function supporting a limited
+// subset of reading instructions, needed to support disk_read.
+
+static
+BYTE send_cmd32 (
+	BYTE cmd,		/* Command byte */
+	DWORD arg		/* Argument */
+)
+{
+	BYTE res;
+    INT countdown;
+ 
+    read_spi_from_system();
+    while (virtual_spi_rx_count > 0) {read_spi_byte();};
+
+    send_spi_byte(0x40 | cmd);
+    send_spi_byte((BYTE)(arg >> 24));
+    send_spi_byte((BYTE)(arg >> 16));
+    send_spi_byte((BYTE)(arg >> 8));
+    send_spi_byte((BYTE)arg);
+    send_spi_byte(0x01);
+    send_spi_byte(0xFF);
+    send_spi_byte(0xFF);
+    send_spi_to_system();
+    while (virtual_spi_rx_count < 8) read_spi_from_system();
+    UNROLL_4(read_spi_byte();)
+    UNROLL_2(read_spi_byte();)
+    
+    if (cmd == CMD12) read_spi_byte();
+
+    countdown = 30;
+    do {
+        UNROLL_4(send_spi_byte(0xFF);)
+        send_spi_to_system();
+        while (virtual_spi_rx_count < 4) read_spi_from_system();
+        UNROLL_4(res = read_spi_byte(); if (!(res & 0x80)) break;)
+    } while (--countdown > 0);
+    spi_commit();
+    return res;
+
+}
 
 /*-----------------------------------------------------------------------*/
 /* Wait for card ready                                                   */
@@ -180,6 +472,8 @@ DRESULT disk_write (
 	BYTE count				/* Sector count (1..255) */
 )
 {
+    end_active_SPI_transaction();
+    
 	if (drv || !count) return RES_PARERR;
 	if (Stat & STA_NOINIT) return RES_NOTRDY;
 	if (Stat & STA_PROTECT) return RES_WRPRT;
@@ -230,6 +524,8 @@ void power_on (void)
 //	SpiChnOpen(SPI_CHANNEL2,SPI_OPEN_MSTEN|SPI_OPEN_CKP_HIGH|SPI_OPEN_SMP_END|SPI_OPEN_MODE8,64); 
 	SpiChnOpen(SPI_CHANNEL,SPI_OPEN_MSTEN|SPI_OPEN_CKP_HIGH|SPI_OPEN_SMP_END|SPI_OPEN_MODE8,64); 
 //	SPI2CONbits.ON = 1;
+    // Enables SPI port to run in Enhanced Buffer mode
+    SPICONbits.ENHBUF = 1;
 	SPICONbits.ON = 1;
 }
 
@@ -295,7 +591,8 @@ int xmit_datablock (	/* 1:OK, 0:Failed */
 	BYTE resp;
 	UINT bc = 512;
 
-
+    end_active_SPI_transaction();
+    
 	if (wait_ready() != 0xFF) return 0;
 
 	xmit_spi(token);		/* Xmit a token */
@@ -329,7 +626,8 @@ BYTE send_cmd (
 {
 	BYTE n, res;
 
-
+    end_active_SPI_transaction();
+    
 	if (cmd & 0x80) {	/* ACMD<n> is the command sequense of CMD55-CMD<n> */
 		cmd &= 0x7F;
 		res = send_cmd(CMD55, 0);
@@ -380,6 +678,7 @@ DSTATUS disk_initialize (
 {
 	BYTE n, cmd, ty, ocr[4];
 
+    end_active_SPI_transaction();
 
 	if (drv) return STA_NOINIT;			/* Supports only single drive */
 	if (Stat & STA_NODISK) return Stat;	/* No card in the socket */
@@ -453,24 +752,22 @@ DRESULT disk_read (
 {
 	if (drv || !count) return RES_PARERR;
 	if (Stat & STA_NOINIT) return RES_NOTRDY;
+    
+    begin_SPI_transaction();
 
 	if (!(CardType & CT_BLOCK)) sector *= 512;	/* Convert to byte address if needed */
 
 	if (count == 1) {		/* Single block read */
-		if ((send_cmd(CMD17, sector) == 0)	/* READ_SINGLE_BLOCK */
-			&& rcvr_datablock(buff, 512))
+		if ((send_cmd32(CMD17, sector) == 0)	/* READ_SINGLE_BLOCK */
+			&& rcvr_datablock32(buff, 512))
 			count = 0;
 	}
 	else {				/* Multiple block read */
-		if (send_cmd(CMD18, sector) == 0) {	/* READ_MULTIPLE_BLOCK */
-			do {
-				if (!rcvr_datablock(buff, 512)) break;
-				buff += 512;
-			} while (--count);
-			send_cmd(CMD12, 0);				/* STOP_TRANSMISSION */
+		if (send_cmd32(CMD18, sector) == 0) {	/* READ_MULTIPLE_BLOCK */
+			if (rcvr_datablock32(buff, count*512)) count = 0;
+			send_cmd32(CMD12, 0);				/* STOP_TRANSMISSION */
 		}
 	}
-	deselect();
 
 	return count ? RES_ERROR : RES_OK;
 }
@@ -489,6 +786,7 @@ DRESULT w (
 	BYTE count				/* Sector count (1..255) */
 )
 {
+    end_active_SPI_transaction();
 	if (drv || !count) return RES_PARERR;
 	if (Stat & STA_NOINIT) return RES_NOTRDY;
 	if (Stat & STA_PROTECT) return RES_WRPRT;
@@ -533,7 +831,8 @@ DRESULT disk_ioctl (
 	BYTE n, csd[16], *ptr = buff;
 	DWORD csize;
 
-
+    end_active_SPI_transaction();
+    
 	if (drv) return RES_PARERR;
 	if (Stat & STA_NOINIT) return RES_NOTRDY;
 
